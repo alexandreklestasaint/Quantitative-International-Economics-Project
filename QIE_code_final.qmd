@@ -1,0 +1,719 @@
+---
+title: "The Impact of the WTO on Bilateral Trade"
+subtitle: "Quantitative International Economics Project"
+author: "Alexandre SAINT, Inès KEMICHA, Louise LE GRUSSE"
+format: pdf
+---
+
+```{r setup, include=FALSE}
+# Options globales pour le rendu
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+# --- 1. Chargement des librairies ---
+library(tidyverse)   # Manipulation de données
+library(fixest)      # Estimation PPML rapide
+library(modelsummary)# Tableaux de régression
+library(readxl)      # Lecture Excel
+library(kableExtra)  # Mise en forme des tableaux
+library(data.table)  # Lecture rapide (fread)
+library(haven)       # Lecture .dta
+library(writexl)     # Export Excel
+
+library(kableExtra)
+# Force le format LaTeX pour éviter les bugs de détection
+options(knitr.table.format = "latex")
+
+```
+
+# Data Preparation
+
+## Importation et Nettoyage de la Base Gravité
+
+Nous utilisons la base Gravity_M2IT.dta pour les caractéristiques des pays et les groupes de revenus, et les données USITC/ITPDE pour les flux commerciaux (afin d'inclure les flux nuls et intra-nationaux).
+
+```{r Importation et Nettoyage de la Base Gravité}
+
+# Définir le chemin d'accès
+path <- "C:/Users/alexa/Documents/Cours Dauphine/Quantitative International Economics/TeamExam/Data/"
+
+# 1. Importation de la base Gravity (Covariables & Income Levels)
+# -------------------------------------------------------------
+df_gravity_raw <- read_dta(paste0(path, "Gravity_M2IT.dta"))
+
+# Sélection des variables auxiliaires nécessaires
+# inc_i / inc_j sont cruciaux pour la classification
+gravity_controls <- df_gravity_raw %>%
+  rename(iso_o = iso3_i, iso_d = iso3_j) %>%
+  select(iso_o, iso_d, year,
+         inc_o = inc_i, inc_d = inc_j, # Classification revenus
+         rta) %>%
+  distinct(iso_o, iso_d, year, .keep_all = TRUE)
+
+# Liste des pays de référence
+liste_pays <- unique(df_gravity_raw$iso3_j)
+
+# 2. Importation des flux USITC (Flux Internationaux & Zéros)
+# -------------------------------------------------------------
+USITC_2000_2004 <- read_csv(paste0(path, "release_2.1_2000_2004.csv"))
+USITC_2005_2009 <- read_csv(paste0(path, "release_2.1_2005_2009.csv"))
+USITC_2010_2014 <- read_csv(paste0(path, "release_2.1_2010_2014.csv"))
+USITC_2015_2019 <- read_csv(paste0(path, "release_2.1_2015_2019.csv"))
+
+USITC_gravity <- bind_rows(USITC_2000_2004, 
+                           USITC_2005_2009, 
+                           USITC_2010_2014, 
+                           USITC_2015_2019) %>% 
+  rename(iso_o = iso3_o, iso_d = iso3_d,
+         gatt_o = member_gatt_o,
+         wto_o = member_wto_o,
+         gatt_d = member_gatt_d,
+         wto_d = member_wto_d,
+         both_gatt = member_gatt_joint,
+         both_wto = member_wto_joint,
+         colony = colony_ever,
+         language = common_language,
+         dist = distance,
+         gdp_o = gdp_wdi_const_o,
+         gdp_d = gdp_wdi_const_d) %>%
+  select(iso_o, iso_d, year, gatt_o, gatt_d, wto_o, wto_d, both_gatt, both_wto, 
+         colony, contiguity, language, dist, gdp_o, gdp_d, pop_o, pop_d, 
+         agree_eia, agree_fta, agree_psa, polity_o, polity_d)
+
+# 3. Importation des flux ITPDE (Flux Intra-nationaux)
+# -------------------------------------------------------------
+ITPDE_trade <- fread(paste0(path, "ITPDE_R03.csv"),
+                     select = c("exporter_iso3", "importer_iso3", "year", "trade")) %>% 
+  rename(iso_o = exporter_iso3, iso_d = importer_iso3, flow = trade) %>%
+  group_by(iso_o, iso_d, year) %>% 
+  summarise(flow = sum(flow, na.rm = TRUE), .groups = 'drop')
+
+# 4. Fusion des flux (USITC + ITPDE)
+# -------------------------------------------------------------
+# On combine pour avoir une matrice aussi complète que possible
+df_flows <- USITC_gravity %>% 
+  left_join(ITPDE_trade, by = c("iso_o", "iso_d", "year")) %>%
+  filter(iso_o %in% liste_pays & iso_d %in% liste_pays)
+
+# 5. Fusion finale : Flux + Contrôles Gravitaires
+# -------------------------------------------------------------
+df_main <- df_flows %>%
+  left_join(gravity_controls, by = c("iso_o", "iso_d", "year")) %>%
+  select(iso_o, iso_d, year, flow, dist, gdp_o, gdp_d, everything()) %>% 
+  # On ne garde que les lignes où on a les infos économiques (PIB, Dist, Inc)
+  filter(!is.na(gdp_o), !is.na(gdp_d), !is.na(dist), !is.na(flow))
+
+# Nettoyage mémoire
+rm(USITC_2000_2004, USITC_2005_2009, USITC_2010_2014, USITC_2015_2019, df_gravity_raw)
+
+
+```
+
+# Feature Engineering
+
+## Classification du Développement (3 Niveaux)
+
+Nous utilisons les variables inc_i et inc_j de la base Gravity. Codification standard : 1=High Income, 2=Upper Middle, 3=Lower Middle, 4=Low Income. Transformation : \* High (H) : 1
+
+Intermediate (I) : 2 & 3
+
+Low (L) : 4
+
+```{r Classification du Développement (3 Niveaux)}
+get_dev_level <- function(code) {
+  case_when(
+    code == "Revenu élevé" ~ "H",              # High
+    code %in% c("Revenu intermédiaire/tranche inférieure", "Revenu intermédiaire/tranche supérieure") ~ "I",      # Intermediate
+    code == "Faible revenu" ~ "L",              # Low
+    TRUE ~ NA_character_
+  )
+}
+
+# Table de lookup
+inc_by_country <- df_main %>%
+  filter(!is.na(inc_o)) %>%
+  distinct(iso_o, inc_o)
+
+# Application
+df_vars <- df_main %>%
+  # Remplacer inc_o et inc_d par les valeurs du lookup
+  select(-inc_o, -inc_d) %>%
+  left_join(inc_by_country %>% rename(inc_o = inc_o), by = "iso_o") %>%
+  left_join(inc_by_country %>% rename(iso_d = iso_o, inc_d = inc_o), by = "iso_d") %>%
+  mutate(
+    dev_o = get_dev_level(inc_o),
+    dev_d = get_dev_level(inc_d)
+  )
+
+```
+
+## Création des 6 Types de Paires (Symétriques)
+
+Nous caractérisons la relation indépendamment du sens du flux. Combinaisons possibles : HH, HI, HL, II, LI, LL.
+
+```{r Création des 6 Types de Paires (Symétriques)}
+
+df_vars <- df_vars %>%
+  mutate(
+    # On classe les deux niveaux par ordre alphabétique pour assurer la symétrie
+    # H < I < L (alphabétiquement)
+    # Donc une paire H-L deviendra "HL", une paire L-H deviendra "HL"
+    p1 = pmin(dev_o, dev_d),
+    p2 = pmax(dev_o, dev_d),
+    pair_type = paste0(p1, p2) 
+  ) %>%
+  # Vérification et renommage explicite pour correspondre à la demande (IL -> LI)
+  mutate(pair_type = case_when(
+    pair_type == "IL" ~ "LI", # Juste pour être sûr de l'ordre LI vs IL
+    TRUE ~ pair_type
+  ))
+
+# Vérification rapide des catégories créées
+table(df_vars$pair_type)
+
+```
+
+## Calcul du Remoteness Index
+
+-\> ajouter impérativement la spécification qui remplace le RI par les country-time FE
+
+Formules : $$ \ln(REM\_EXP_{it}) = \ln\left(\sum_j \frac{DIST_{ij}}{Y_{jt}/Y_t}\right) $$ $$ \ln(REM\_IMP_{jt}) = \ln\left(\sum_i \frac{DIST_{ij}}{Y_{it}/Y_t}\right) $$
+
+```{r Calcul du Remoteness Index}
+# 1. Calcul du PIB Mondial par année (Y_t)
+world_gdp <- df_vars %>%
+  select(iso_o, year, gdp_o) %>%
+  distinct() %>%
+  group_by(year) %>%
+  summarise(Y_t = sum(gdp_o, na.rm = TRUE))
+
+# 2. Préparation des parts de marché (GDP Shares)
+df_rem_prep <- df_vars %>%
+  left_join(world_gdp, by = "year") %>%
+  mutate(
+    share_o = gdp_o / Y_t, # Part du PIB mondial de l'origine
+    share_d = gdp_d / Y_t  # Part du PIB mondial de la destination
+  )
+
+# 3. Calcul de l'indice pour chaque Exportateur i à l'année t
+rem_exp <- df_rem_prep %>%
+  group_by(iso_o, year) %>%
+  summarise(
+    # Somme sur tous les partenaires j
+    raw_rem_exp = sum(dist / share_d, na.rm = TRUE), 
+    .groups = 'drop'
+  ) %>%
+  mutate(ln_rem_exp = log(raw_rem_exp)) %>%
+  rename(iso = iso_o)
+
+# 4. Calcul de l'indice pour chaque Importateur j à l'année t
+rem_imp <- df_rem_prep %>%
+  group_by(iso_d, year) %>%
+  summarise(
+    # Somme sur tous les partenaires i
+    raw_rem_imp = sum(dist / share_o, na.rm = TRUE),
+    .groups = 'drop'
+  ) %>%
+  mutate(ln_rem_imp = log(raw_rem_imp)) %>%
+  rename(iso = iso_d)
+
+# 5. Injection dans la base finale
+df_est <- df_vars %>%
+  left_join(rem_exp, by = c("iso_o" = "iso", "year")) %>%
+  left_join(rem_imp, by = c("iso_d" = "iso", "year")) %>%
+  filter(!is.na(pair_type), !is.na(flow))
+
+# Création des logs pour le modèle traditionnel
+df_est <- df_est %>%
+  mutate(
+    ln_dist = log(dist),
+    ln_gdp_o = log(gdp_o),
+    ln_gdp_d = log(gdp_d)
+  )
+
+glimpse(df_est)
+```
+
+-\> faut-il vraiment utiliser des logs pour la distance et le gdp ? et la population ?
+
+## Création de la variable INTL_BRDR
+
+```{r Création de la variable INTL_BRDR}
+
+# Variable dummy : TRUE si commerce international, FALSE si commerce domestique
+# Note : Pour modelsummary et fixest, il est parfois plus sûr de l'avoir en numérique (0/1) 
+# pour les interactions, bien que les booléens fonctionnent.
+
+df_est <- df_est %>% 
+  mutate(INTL_BRDR = ifelse(iso_o != iso_d, 1, 0)) %>%
+  select(iso_o, iso_d, year, INTL_BRDR, everything())
+
+```
+
+# Création des variables "One Member", des variables temporelles ainsi que des l
+
+```{r Feature Engineering}
+# --- Feature Engineering Avancé ---
+
+# 1. Création des variables "One Member" et variables temporelles
+df_est <- df_est %>% 
+  mutate(
+    # Un des deux est membre (max des deux dummies)
+    one_wto = ifelse(wto_o + wto_d == 1, 1, 0),
+    one_gatt = ifelse(gatt_o + gatt_d == 1, 1, 0),
+    # Création des dummies années pour les contrôles de globalisation
+    year2000 = ifelse(year == 2000, 1, 0),
+    year2004 = ifelse(year == 2004, 1, 0),
+    year2009 = ifelse(year == 2009, 1, 0),
+    year2014 = ifelse(year == 2014, 1, 0),
+    year2019 = ifelse(year == 2019, 1, 0)
+  )
+
+# 2. Création des Lags et Leads (Variables dynamiques)
+# Il faut grouper par paire pour que le lag/lead ait du sens temporellement
+df_est <- df_est %>%
+  arrange(iso_o, iso_d, year) %>% # Tri important
+  group_by(iso_o, iso_d) %>%
+  mutate(
+    # Lags de FTA (-4, -8, -12)
+    fta_lag4 = lag(agree_fta, 4),
+    fta_lag8 = lag(agree_fta, 8),
+    fta_lag12 = lag(agree_fta, 12),
+    
+    # Lead de FTA (+4)
+    fta_lead4 = lead(agree_fta, 4),
+    
+    # Leads de WTO (+1, +4) comme demandé dans l'Excel
+    one_wto_lead1 = lead(one_wto, 1),
+    one_wto_lead4 = lead(one_wto, 4),
+    both_wto_lead1 = lead(both_wto, 1),
+    both_wto_lead4 = lead(both_wto, 4)
+  ) %>%
+  ungroup()
+```
+
+# Analyse Exploratoire
+
+```{r Analyse Exploratoire}
+df_est %>%
+  group_by(pair_type) %>%
+  summarise(
+    Obs = n(),
+    Avg_Trade = mean(flow, na.rm=TRUE),
+    Share_one_WTO = mean(wto_o, na.rm = TRUE),
+    Share_both_WTO = mean(both_wto, na.rm=TRUE),
+    Avg_Dist = mean(dist, na.rm=TRUE)
+  ) %>%
+  kbl(caption = "Descriptive Statistics by Pair Type (Development Level)", digits = 1) %>%
+  kable_styling(latex_options = c("striped", "hold_position"))
+```
+
+# Estimation Économétrique
+
+Nous comparons ici l'approche Structurelle (recommandée, avec Effets Fixes) et l'approche Traditionnelle (avec Covariables Gravitaires et Remoteness Index).
+
+Spécifications - Structural Baseline : Effets fixes Paire + Pays-Temps. Capture parfaitement les résistances multilatérales. - Structural Heterogeneity : Idem, mais décompose l'effet OMC selon les 6 types de paires. - Traditional Gravity : Pas d'effets fixes paires ni pays-temps. On utilise les variables explicites ($Log(GDP)$, $Log(Dist)$, $Log(Remoteness)$, etc.) et des effets fixes Année uniquement.
+
+## Spécifications Économétriques
+
+Pour estimer l'impact de l'OMC sur les flux commerciaux, nous utilisons l'estimateur PPML (Poisson Pseudo Maximum Likelihood). La forme fonctionnelle générale est exponentielle : $E[X_{ijt}] = \exp(Z_{ijt}\beta)$. Afin d'isoler l'effet de l'OMC de la tendance générale à la mondialisation (baisse séculaire des coûts de commerce pour tous les pays), nous incluons dans toutes les spécifications un terme d'interaction entre une dummy de frontière internationale et les effets fixes temporels.
+
+1.  Modèle Baseline Structurel
+
+Ce modèle suit les recommandations de Larch et al. (2016) et Yotov et al. (2016). Il inclut des effets fixes de haute dimension ainsi qu'un contrôle pour la "Border Wave" (globalisation).
+
+$$
+X_{ijt} = \exp \left[ \beta_1 WTO_{ijt} + \beta_2 FTA_{ijt} + \sum_{t \in T} \delta_t (INTL\_BRDR_{ij} \times \text{Year}_t) + \pi_{it} + \chi_{jt} + \mu_{ij} \right] \times \epsilon_{ijt}
+$$
+
+**Variables :**
+
+-   $WTO_{ijt}$ : Variable muette valant 1 si l'exportateur $i$ et l'importateur $j$ sont membres de l'OMC à l'année $t$
+-   $FTA_{ijt}$ : Variable muette valant 1 s'il existe un accord commercial en vigueur
+-   $\sum_{t} \delta_t (INTL\_BRDR_{ij} \times \text{Year}_t)$ : Termes d'interaction capturant l'évolution temporelle de l'effet frontière (tendance de mondialisation commune à toutes les paires internationales) pour les années $T \in \{2000, 2004, 2009, 2014, 2019\}$
+-   $\pi_{it}, \chi_{jt}$ : Effets fixes Exportateur-Année et Importateur-Année (capturent les résistances multilatérales)
+-   $\mu_{ij}$ : Effets fixes Paire (capturent la distance, la culture, l'histoire).
+
+2.  Modèle Hétérogène (Structural Heterogeneity)
+
+Nous décomposons l'effet de l'OMC selon le niveau de développement de la paire de pays. Soit $K = \{HH, HL, HI, II, LI, LL\}$ l'ensemble des 6 catégories de paires.
+
+$$
+X_{ijt} = \exp \left[ \sum_{k \in K} \beta_k (WTO_{ijt} \times \mathbb{I}_{ij}^k) + \beta_{FTA} FTA_{ijt} + \sum_{t} \delta_t (INTL\_BRDR_{ij} \times \text{Year}_t) + \pi_{it} + \chi_{jt} + \mu_{ij} \right] \times \epsilon_{ijt}
+$$ Où $\mathbb{I}_{ij}^k$ est une variable indicatrice valant 1 si la paire $ij$ appartient à la catégorie $k$ (ex: High-High).
+
+3.  Modèle de Robustesse (Sans RTA)
+
+Pour vérifier si le coefficient de l'OMC capture l'effet des accords régionaux (biais de variable omise), nous excluons la variable $RTA$, tout en conservant le contrôle pour la tendance de globalisation.
+
+$$
+X_{ijt} = \exp \left[ \sum_{k \in K} \beta_k (WTO_{ijt} \times \mathbb{I}_{ij}^k) + \sum_{t} \delta_t (INTL\_BRDR_{ij} \times \text{Year}_t) + \pi_{it} + \chi_{jt} + \mu_{ij} \right] \times \epsilon_{ijt}
+$$
+
+4.  Modèle Gravitaire Traditionnel (Traditional Gravity)
+
+Ce modèle remplace les effets fixes paires par des covariables explicites, relatives au trade costs. Les effets fixes exportateur-temps ($\pi_{it}$) et importateur-temps ($\chi_{it}$) sont conservés pour tenir compte de la résistance multilatérale.
+
+$$
+\begin{aligned}
+X_{ijt} = \exp \Bigg[ 
+  & \sum_{k \in K} \beta_k \left( WTO_{ijt} \times \mathbb{I}_{ij}^k \right) 
+  + \beta_{FTA} \, FTA_{ijt} \\
+  & + \sum_{t} \delta_t \left( INTL\_BRDR_{ij} \times \text{Year}_t \right) \\
+  & + \alpha_1 \ln Y_{it} + \alpha_2 \ln E_{jt} \\
+  & + \gamma_1 \ln DIST_{ij} + \gamma_2 \, CONTIG_{ij} + \gamma_3 \, LANG_{ij}
+\Bigg] \times \varepsilon_{ijt}
+\end{aligned}
+$$
+
+**Variables additionnelles :**
+
+-   $Y_{it}, E_{jt}$ : PIB de l'exportateur et de l'importateur (Log). \*
+
+-   Variables gravitaires standard : Distance ($DIST$) en log, Contiguité ($CONTIG$), Langue commune ($LANG$), Lien colonial ($COLONY$).
+
+## Estimation avec PPML
+
+-\> mettre plutôt INTL_BRDR_2000, INTL_BRDR_2005, INTL_BRDR_2010, INTL_BRDR_2015, INTL_BRDR_2019
+
+```{r Estimation Économétrique}
+
+# --- Définition des Contrôles de Globalisation (Communs à tous) ---
+glob_controls <- c("INTL_BRDR:year2000", "INTL_BRDR:year2004", 
+                   "INTL_BRDR:year2009", "INTL_BRDR:year2014", "INTL_BRDR:year2019")
+f_glob <- as.formula(paste("~", paste(glob_controls, collapse = "+")))
+
+# ==============================================================================
+# PARTIE A : SANS HÉTÉROGÉNÉITÉ (Effets Moyens)
+# ==============================================================================
+
+# (1) Sans FE paire (Gravité Traditionnelle avec FE Pays-Temps)
+# Inclut les variables gravitaires géographiques
+m1 <- fepois(flow ~ one_gatt + one_wto + both_gatt + both_wto + 
+               ln_dist + language + contiguity + colony +
+               INTL_BRDR:year2000 + INTL_BRDR:year2004 + INTL_BRDR:year2009 + 
+               INTL_BRDR:year2014 + INTL_BRDR:year2019 | 
+               iso_o^year + iso_d^year, 
+             data = df_est, cluster = ~iso_o + iso_d)
+
+# (2) Avec FE paire (Structurel Baseline)
+# Les variables géographiques fixes sont absorbées par les FE paires
+m2 <- fepois(flow ~ one_gatt + one_wto + both_gatt + both_wto + 
+               INTL_BRDR:year2000 + INTL_BRDR:year2004 + INTL_BRDR:year2009 + 
+               INTL_BRDR:year2014 + INTL_BRDR:year2019 | 
+               iso_o^year + iso_d^year + iso_o^iso_d, 
+             data = df_est, cluster = ~iso_o + iso_d)
+
+# (3) Avec endogénéité (Ajout FTA)
+m3 <- fepois(flow ~ one_gatt + one_wto + both_gatt + both_wto + agree_fta +
+               INTL_BRDR:year2000 + INTL_BRDR:year2004 + INTL_BRDR:year2009 + 
+               INTL_BRDR:year2014 + INTL_BRDR:year2019 | 
+               iso_o^year + iso_d^year + iso_o^iso_d, 
+             data = df_est, cluster = ~iso_o + iso_d)
+
+# (4) Avec lags (Dynamique passée)
+m4 <- fepois(flow ~ one_gatt + one_wto + both_gatt + both_wto + agree_fta +
+               fta_lag4 + fta_lag8 + fta_lag12 +
+               INTL_BRDR:year2000 + INTL_BRDR:year2004 + INTL_BRDR:year2009 + 
+               INTL_BRDR:year2014 + INTL_BRDR:year2019 | 
+               iso_o^year + iso_d^year + iso_o^iso_d, 
+             data = df_est, cluster = ~iso_o + iso_d)
+
+# (5) Avec lags et leads (Test de stricte exogénéité)
+m5 <- fepois(flow ~ one_gatt + one_wto + both_gatt + both_wto + agree_fta +
+               fta_lag4 + fta_lag8 + fta_lag12 +
+               fta_lead4 + one_wto_lead1 + one_wto_lead4 + both_wto_lead1 + both_wto_lead4 +
+               INTL_BRDR:year2000 + INTL_BRDR:year2004 + INTL_BRDR:year2009 + 
+               INTL_BRDR:year2014 + INTL_BRDR:year2019 | 
+               iso_o^year + iso_d^year + iso_o^iso_d, 
+             data = df_est, cluster = ~iso_o + iso_d)
+
+# ==============================================================================
+# PARTIE B : AVEC HÉTÉROGÉNÉITÉ (Interactions pair_type)
+# ==============================================================================
+
+# (1d) Sans FE paire (Interactions)
+m1d <- fepois(flow ~ one_gatt:pair_type + one_wto:pair_type + both_gatt:pair_type + both_wto:pair_type + 
+                ln_dist + language + contiguity + colony +
+                INTL_BRDR:year2000 + INTL_BRDR:year2004 + INTL_BRDR:year2009 + 
+                INTL_BRDR:year2014 + INTL_BRDR:year2019 | 
+                iso_o^year + iso_d^year, 
+              data = df_est, cluster = ~iso_o + iso_d)
+
+# (2d) Avec FE paire
+m2d <- fepois(flow ~ one_gatt:pair_type + one_wto:pair_type + both_gatt:pair_type + both_wto:pair_type + 
+                INTL_BRDR:year2000 + INTL_BRDR:year2004 + INTL_BRDR:year2009 + 
+                INTL_BRDR:year2014 + INTL_BRDR:year2019 | 
+                iso_o^year + iso_d^year + iso_o^iso_d, 
+              data = df_est, cluster = ~iso_o + iso_d)
+
+# (3d) Avec endogénéité (Ajout FTA)
+m3d <- fepois(flow ~ one_gatt:pair_type + one_wto:pair_type + both_gatt:pair_type + both_wto:pair_type + 
+                agree_fta +
+                INTL_BRDR:year2000 + INTL_BRDR:year2004 + INTL_BRDR:year2009 + 
+                INTL_BRDR:year2014 + INTL_BRDR:year2019 | 
+                iso_o^year + iso_d^year + iso_o^iso_d, 
+              data = df_est, cluster = ~iso_o + iso_d)
+
+# (4d) Avec lags
+m4d <- fepois(flow ~ one_gatt:pair_type + one_wto:pair_type + both_gatt:pair_type + both_wto:pair_type + 
+                agree_fta + fta_lag4 + fta_lag8 + fta_lag12 +
+                INTL_BRDR:year2000 + INTL_BRDR:year2004 + INTL_BRDR:year2009 + 
+                INTL_BRDR:year2014 + INTL_BRDR:year2019 | 
+                iso_o^year + iso_d^year + iso_o^iso_d, 
+              data = df_est, cluster = ~iso_o + iso_d)
+
+# (5d) Avec lags et leads
+m5d <- fepois(flow ~ one_gatt:pair_type + one_wto:pair_type + both_gatt:pair_type + both_wto:pair_type + 
+                agree_fta + fta_lag4 + fta_lag8 + fta_lag12 +
+                fta_lead4 + one_wto_lead1 + one_wto_lead4 + both_wto_lead1 + both_wto_lead4 +
+                INTL_BRDR:year2000 + INTL_BRDR:year2004 + INTL_BRDR:year2009 + 
+                INTL_BRDR:year2014 + INTL_BRDR:year2019 | 
+                iso_o^year + iso_d^year + iso_o^iso_d, 
+              data = df_est, cluster = ~iso_o + iso_d)
+```
+
+# Résultats et Interprétation
+
+## Résultats
+
+```{r results_table}
+
+# --- Mapping EXHAUSTIF des noms de variables ---
+# Il faut que TOUTES les variables d'intérêt de TOUS les modèles soient ici
+coef_map_excel <- c(
+  # --- Variables Simples (Modèles 1-5) ---
+  "one_gatt" = "One GATT Member",
+  "one_wto" = "One WTO Member",
+  "both_gatt" = "Both GATT Members",
+  "both_wto" = "Both WTO Members",
+  "agree_fta" = "FTA Agreement",
+  
+  # --- Variables Géographiques (Modèles 1 et 1d) ---
+  "ln_dist" = "Log Distance",
+  "language" = "Common Language",
+  "contiguity" = "Contiguity",
+  "colony" = "Colony",
+  
+  # --- Lags & Leads ---
+  "fta_lag4" = "FTA Lag (4y)",
+  "fta_lag8" = "FTA Lag (8y)",
+  "fta_lag12" = "FTA Lag (12y)",
+  "fta_lead4" = "FTA Lead (4y)",
+  
+  "one_wto_lead1" = "One WTO Lead (1y)",
+  "one_wto_lead4" = "One WTO Lead (4y)",
+  "both_wto_lead1" = "Both WTO Lead (1y)",
+  "both_wto_lead4" = "Both WTO Lead (4y)",
+  
+  # --- Interactions Hétérogènes (Modèles 1d-5d) ---
+  # IMPORTANT : L'ordre "variable:pair_type" ou "pair_type:variable" dépend de fixest
+  # Par sécurité, on met souvent les deux ou on vérifie les noms exacts avec names(coef(m1d))
+  
+  # Both WTO x Pair Type
+  "both_wto:pair_typeHH" = "Both WTO x HH",
+  "both_wto:pair_typeHI" = "Both WTO x HI",
+  "both_wto:pair_typeHL" = "Both WTO x HL",
+  "both_wto:pair_typeII" = "Both WTO x II",
+  "both_wto:pair_typeLI" = "Both WTO x LI",
+  "both_wto:pair_typeLL" = "Both WTO x LL",
+  "pair_typeHH:both_wto" = "Both WTO x HH", # Sécurité inversion
+  "pair_typeHI:both_wto" = "Both WTO x HI",
+  "pair_typeHL:both_wto" = "Both WTO x HL",
+  "pair_typeII:both_wto" = "Both WTO x II",
+  "pair_typeLI:both_wto" = "Both WTO x LI",
+  "pair_typeLL:both_wto" = "Both WTO x LL",
+
+  # One WTO x Pair Type
+  "one_wto:pair_typeHH" = "One WTO x HH",
+  "one_wto:pair_typeHI" = "One WTO x HI",
+  "one_wto:pair_typeHL" = "One WTO x HL",
+  "one_wto:pair_typeII" = "One WTO x II",
+  "one_wto:pair_typeLI" = "One WTO x LI",
+  "one_wto:pair_typeLL" = "One WTO x LL",
+  "pair_typeHH:one_wto" = "One WTO x HH",
+  "pair_typeHI:one_wto" = "One WTO x HI",
+  "pair_typeHL:one_wto" = "One WTO x HL",
+  "pair_typeII:one_wto" = "One WTO x II",
+  "pair_typeLI:one_wto" = "One WTO x LI",
+  "pair_typeLL:one_wto" = "One WTO x LL",
+
+  # Both GATT x Pair Type (C'était probablement ça qui manquait !)
+  "both_gatt:pair_typeHH" = "Both GATT x HH",
+  "both_gatt:pair_typeHI" = "Both GATT x HI",
+  "both_gatt:pair_typeHL" = "Both GATT x HL",
+  "both_gatt:pair_typeII" = "Both GATT x II",
+  "both_gatt:pair_typeLI" = "Both GATT x LI",
+  "both_gatt:pair_typeLL" = "Both GATT x LL",
+  "pair_typeHH:both_gatt" = "Both GATT x HH",
+  "pair_typeHI:both_gatt" = "Both GATT x HI",
+  "pair_typeHL:both_gatt" = "Both GATT x HL",
+  "pair_typeII:both_gatt" = "Both GATT x II",
+  "pair_typeLI:both_gatt" = "Both GATT x LI",
+  "pair_typeLL:both_gatt" = "Both GATT x LL",
+
+  # One GATT x Pair Type
+  "one_gatt:pair_typeHH" = "One GATT x HH",
+  "one_gatt:pair_typeHI" = "One GATT x HI",
+  "one_gatt:pair_typeHL" = "One GATT x HL",
+  "one_gatt:pair_typeII" = "One GATT x II",
+  "one_gatt:pair_typeLI" = "One GATT x LI",
+  "one_gatt:pair_typeLL" = "One GATT x LL",
+  "pair_typeHH:one_gatt" = "One GATT x HH",
+  "pair_typeHI:one_gatt" = "One GATT x HI",
+  "pair_typeHL:one_gatt" = "One GATT x HL",
+  "pair_typeII:one_gatt" = "One GATT x II",
+  "pair_typeLI:one_gatt" = "One GATT x LI",
+  "pair_typeLL:one_gatt" = "One GATT x LL"
+)
+
+# --- Lignes d'effets fixes ---
+rows <- data.frame(
+  "Term" = c("Pair Fixed Effects", "Origin-Year FE", "Dest-Year FE"),
+  "(1)" = c("No", "Yes", "Yes"),
+  "(2)" = c("Yes", "Yes", "Yes"),
+  "(3)" = c("Yes", "Yes", "Yes"),
+  "(4)" = c("Yes", "Yes", "Yes"),
+  "(5)" = c("Yes", "Yes", "Yes"),
+  "(1d)" = c("No", "Yes", "Yes"),
+  "(2d)" = c("Yes", "Yes", "Yes"),
+  "(3d)" = c("Yes", "Yes", "Yes"),
+  "(4d)" = c("Yes", "Yes", "Yes"),
+  "(5d)" = c("Yes", "Yes", "Yes")
+)
+
+# --- Génération du Tableau ---
+# On utilise coef_omit pour nettoyer ce qu'on ne veut PAS voir (les contrôles INTL_BRDR)
+# Tout ce qui est dans coef_map sera affiché (si présent dans le modèle)
+modelsummary(
+  list(
+    "(1)" = m1, "(2)" = m2, "(3)" = m3, "(4)" = m4, "(5)" = m5,
+    "(1d)" = m1d, "(2d)" = m2d, "(3d)" = m3d, "(4d)" = m4d, "(5d)" = m5d
+  ),
+  coef_map = coef_map_excel,
+  coef_omit = "^INTL_BRDR", 
+  add_rows = rows,
+  gof_map = c("nobs", "r.squared.pseudo"),
+  output = "kableExtra",
+  title = "Impact of WTO on Trade: Average vs. Heterogeneous Effects",
+  # --- AJOUT ICI ---
+  stars = c('*' = .1, '**' = .05, '***' = .01)
+  # -----------------
+) %>%
+  kable_styling(latex_options = c("scale_down", "hold_position"), font_size = 5) %>%
+  add_header_above(c(" " = 1, "Average Effects" = 5, "Heterogeneous Effects" = 5)) %>%
+  landscape()
+
+
+```
+
+```{r export_coefficients}
+# Export des coefficients pour le tableau LaTeX
+library(broom)
+
+coeffs <- bind_rows(
+
+tidy(m1, conf.int = TRUE) %>% mutate(model = "(1)"),
+tidy(m2, conf.int = TRUE) %>% mutate(model = "(2)"),
+tidy(m3, conf.int = TRUE) %>% mutate(model = "(3)"),
+tidy(m4, conf.int = TRUE) %>% mutate(model = "(4)"),
+tidy(m5, conf.int = TRUE) %>% mutate(model = "(5)"),
+tidy(m1d, conf.int = TRUE) %>% mutate(model = "(1d)"),
+tidy(m2d, conf.int = TRUE) %>% mutate(model = "(2d)"),
+tidy(m3d, conf.int = TRUE) %>% mutate(model = "(3d)"),
+tidy(m4d, conf.int = TRUE) %>% mutate(model = "(4d)"),
+tidy(m5d, conf.int = TRUE) %>% mutate(model = "(5d)")
+)
+
+# Nombre d'observations par modèle
+nobs_df <- data.frame(
+  model = c("(1)", "(2)", "(3)", "(4)", "(5)", "(1d)", "(2d)", "(3d)", "(4d)", "(5d)"),
+  nobs = c(nobs(m1), nobs(m2), nobs(m3), nobs(m4), nobs(m5),
+           nobs(m1d), nobs(m2d), nobs(m3d), nobs(m4d), nobs(m5d))
+)
+
+# Sauvegarder
+write_csv(coeffs, paste0(path, "coefficients_export.csv"))
+write_csv(nobs_df, paste0(path, "nobs_export.csv"))
+
+# Afficher un résumé
+coeffs %>%
+  filter(str_detect(term, "wto|gatt|fta|dist|language|contiguity|colony")) %>%
+  select(model, term, estimate, std.error, p.value) %>%
+  mutate(
+    estimate = round(estimate, 3),
+    std.error = round(std.error, 3),
+    stars = case_when(
+      p.value < 0.01 ~ "***",
+      p.value < 0.05 ~ "**",
+      p.value < 0.10 ~ "*",
+      TRUE ~ ""
+    )
+  ) %>%
+  select(-p.value) %>%
+  pivot_wider(names_from = model, values_from = c(estimate, std.error, stars)) %>%
+  kbl(caption = "Exported Coefficients Summary") %>%
+  kable_styling(latex_options = c("scale_down", "hold_position"), font_size = 6)
+```
+
+## Interpretation of Results
+
+### 1. Baseline Aggregate Effect (Column 1)
+
+The average effect of joint WTO membership on bilateral trade is **negative and marginally significant** ($\beta = -0.197$, $p < 0.10$). This implies that, holding constant pair-specific unobserved heterogeneity, country-time multilateral resistance terms, and the secular globalization trend, WTO membership is associated with approximately **18% lower trade flows** (calculated as $\exp(-0.197) - 1 \approx -0.18$).
+
+This counterintuitive result aligns with the well-documented **"Rose Puzzle"** (Rose, 2004), which found little evidence that the GATT/WTO significantly increased trade once proper controls were included. Our structural specification, which absorbs bilateral heterogeneity through pair fixed effects, suggests that the naive positive correlation between WTO membership and trade observed in simpler models is largely driven by **omitted variable bias**---countries that trade more intensively tend to join the WTO, rather than the WTO causing increased trade.
+
+The coefficient on **Free Trade Agreements (FTA)** is positive and highly significant ($\beta = 0.172$, $p < 0.01$), indicating that regional trade agreements increase bilateral trade by approximately **19%**. This suggests that deep preferential liberalization through FTAs is a more effective trade-creation mechanism than multilateral WTO membership.
+
+### 2. Heterogeneous Effects by Development Level (Column 2)
+
+Decomposing the WTO effect by country-pair development categories reveals striking heterogeneity:
+
+**Significant Negative Effects:**
+
+-   **High-High pairs** ($\beta = -0.373$, $p < 0.01$): Trade between developed economies is **31% lower** when both are WTO members, conditional on pair fixed effects. This surprising result likely reflects an *identification problem*: most High-Income countries were already GATT/WTO members before our sample period (2000--2019), leaving minimal within-pair variation to identify the effect. The negative coefficient may capture residual confounding factors or reverse causality.
+
+-   **High-Low pairs** ($\beta = -0.427$, $p < 0.05$): North-South trade appears **35% lower** under joint WTO membership. This could reflect the asymmetric nature of WTO accession commitments, where developing countries often face stringent liberalization requirements that may initially disrupt existing trade patterns.
+
+**Insignificant Effects:**
+
+-   **High-Intermediate**, **Low-Intermediate**, and **Intermediate-Intermediate** pairs show statistically insignificant coefficients, suggesting that the WTO has no discernible marginal impact on trade for these country combinations once bilateral heterogeneity is controlled.
+
+**Positive but Insignificant:**
+
+-   **Low-Low pairs** ($\beta = 0.428$, $p > 0.10$): The large positive point estimate suggests potential trade creation among developing economies, but the high standard error (0.568) reflects limited statistical power due to the small sample size for this category (only 9,757 observations).
+
+### 3. Robustness Check: Omitting RTAs (Column 3)
+
+Column (3) excludes the FTA control variable to assess potential **omitted variable bias**. The WTO coefficients remain virtually unchanged compared to Column (2):
+
+-   WTO $\times$ HH: $-0.361^{***}$ vs. $-0.373^{***}$
+-   WTO $\times$ HL: $-0.434^{**}$ vs. $-0.427^{**}$
+
+This stability indicates that our WTO estimates are **not confounded by regional trade agreements**. The FTA and WTO variables capture distinct phenomena: FTAs represent deep bilateral liberalization, while WTO membership reflects participation in the multilateral rules-based system.
+
+### 4. Traditional Gravity Model (Column 4)
+
+The traditional specification **without pair fixed effects** yields dramatically different results. All WTO interaction terms become large, positive, and highly significant:
+
+-   WTO $\times$ HH: $+2.398^{***}$ (implying a 1,000%+ trade increase)
+-   WTO $\times$ LL: $+5.847^{***}$ (implying a 34,000%+ trade increase)
+
+These implausibly large coefficients reveal severe **endogeneity bias** when pair fixed effects are omitted. Countries that share strong historical, cultural, or economic ties are more likely to (a) trade intensively and (b) both join the WTO. Without controlling for time-invariant bilateral heterogeneity, the WTO dummy captures these omitted factors rather than the causal effect of membership.
+
+The gravity covariates in Column (4) display expected signs:
+
+-   **Log Distance** ($\beta = -1.503^{***}$): A 1% increase in distance reduces trade by approximately 1.5%, consistent with standard gravity estimates.
+-   **Common Language** ($\beta = 0.990^{***}$): Shared language nearly triples trade ($\exp(0.99) \approx 2.7$).
+-   **Contiguity** ($\beta = -0.697^{***}$): The negative sign is anomalous and may reflect multicollinearity with distance or specification issues.
+-   **Colony Link** ($\beta = -0.470^{*}$): The negative coefficient contradicts expectations and warrants further investigation.
+
+### 5. Key Takeaways
+
+1.  **The structural approach matters**: Pair fixed effects dramatically alter the estimated WTO effect, shifting it from large and positive to small or negative. This underscores the importance of controlling for unobserved bilateral heterogeneity in gravity models.
+
+2.  **The WTO's marginal trade impact is limited**: Once we account for pair-specific factors and the secular globalization trend, WTO membership does not appear to generate significant additional trade flows. This confirms the Rose Puzzle using modern structural gravity methods.
+
+3.  **FTAs dominate the WTO**: Regional trade agreements have a robust, positive effect on trade ($\approx 19\%$), while the WTO's contribution is negligible or negative. This suggests that the WTO's primary value may lie in providing a **rules-based framework and dispute resolution mechanism** rather than directly creating trade.
+
+4.  **Heterogeneity across development levels**: The negative coefficients for High-High and High-Low pairs likely reflect identification challenges rather than genuine trade-destroying effects of the WTO. Future research should focus on specific accession events (e.g., China 2001, Russia 2012) using event-study designs to better identify causal effects.
