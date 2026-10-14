@@ -1,0 +1,464 @@
+---
+title: "The Impact of the WTO on Bilateral Trade"
+subtitle: "Structural gravity estimates with PPML, 2000-2018"
+author: "Alexandre Saint, Inès Kemicha, Louise Le Grusse"
+date: "January 2026"
+format:
+  pdf:
+    geometry: margin=2cm
+    fontsize: 11pt
+    number-sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+
+library(tidyverse)
+library(fixest)
+library(modelsummary)
+library(kableExtra)
+library(data.table)
+library(haven)
+
+options(knitr.table.format = "latex")
+```
+
+# Introduction
+
+Does WTO membership raise trade between members? Cross-sectional gravity estimates usually find large positive effects, while Rose (2004) found little evidence once country-pair heterogeneity is taken seriously. We revisit the question on annual data for 2000-2018 using a structural gravity model estimated by Poisson pseudo-maximum likelihood (PPML, Santos Silva and Tenreyro, 2006), with exporter-year, importer-year and country-pair fixed effects (Yotov et al., 2016). We also ask whether the effect differs with the development level of the two partners.
+
+This project was carried out for the Quantitative International Economics course of the M2 at Université Paris Dauphine-PSL. The R code behind every table and figure is in the source file `wto_gravity_ppml.qmd`.
+
+# Data
+
+We combine three sources:
+
+-   **USITC Dynamic Gravity Dataset** (release 2.1): WTO and GATT membership, trade agreements, distance, common language, contiguity, colonial ties and GDP, by country pair and year.
+-   **USITC International Trade and Production Database for Estimation** (ITPDE, release 3): bilateral trade flows, including zero flows and domestic flows (a country's sales to itself).
+-   **Gravity_M2IT**, a gravity database provided in the course: World Bank income group of each country.
+
+We keep observations with non-missing trade flows, GDP and distance. The resulting sample covers 2000-2018.
+
+```{r data_import}
+# Raw data go in Data/ (not tracked by git):
+# - Gravity_M2IT.dta: course gravity file, not redistributable
+# - release_2.1_*.csv: USITC Dynamic Gravity Dataset, https://www.usitc.gov/data/gravity/dgd.htm
+# - ITPDE_R03.csv: USITC ITPDE release 3, https://www.usitc.gov/data/gravity/itpde.htm
+data_dir <- "Data"
+
+df_gravity_raw <- read_dta(file.path(data_dir, "Gravity_M2IT.dta"))
+
+gravity_controls <- df_gravity_raw %>%
+  rename(iso_o = iso3_i, iso_d = iso3_j) %>%
+  select(iso_o, iso_d, year,
+         inc_o = inc_i, inc_d = inc_j,
+         rta) %>%
+  distinct(iso_o, iso_d, year, .keep_all = TRUE)
+
+liste_pays <- unique(df_gravity_raw$iso3_j)
+
+USITC_2000_2004 <- read_csv(file.path(data_dir, "release_2.1_2000_2004.csv"))
+USITC_2005_2009 <- read_csv(file.path(data_dir, "release_2.1_2005_2009.csv"))
+USITC_2010_2014 <- read_csv(file.path(data_dir, "release_2.1_2010_2014.csv"))
+USITC_2015_2019 <- read_csv(file.path(data_dir, "release_2.1_2015_2019.csv"))
+
+USITC_gravity <- bind_rows(USITC_2000_2004,
+                           USITC_2005_2009,
+                           USITC_2010_2014,
+                           USITC_2015_2019) %>%
+  rename(iso_o = iso3_o, iso_d = iso3_d,
+         gatt_o = member_gatt_o,
+         wto_o = member_wto_o,
+         gatt_d = member_gatt_d,
+         wto_d = member_wto_d,
+         both_gatt = member_gatt_joint,
+         both_wto = member_wto_joint,
+         colony = colony_ever,
+         language = common_language,
+         dist = distance,
+         gdp_o = gdp_wdi_const_o,
+         gdp_d = gdp_wdi_const_d) %>%
+  select(iso_o, iso_d, year, gatt_o, gatt_d, wto_o, wto_d, both_gatt, both_wto,
+         colony, contiguity, language, dist, gdp_o, gdp_d, pop_o, pop_d,
+         agree_eia, agree_fta, agree_psa, polity_o, polity_d)
+
+# ITPDE is by industry: aggregate to total trade per pair and year
+ITPDE_trade <- fread(file.path(data_dir, "ITPDE_R03.csv"),
+                     select = c("exporter_iso3", "importer_iso3", "year", "trade")) %>%
+  rename(iso_o = exporter_iso3, iso_d = importer_iso3, flow = trade) %>%
+  group_by(iso_o, iso_d, year) %>%
+  summarise(flow = sum(flow, na.rm = TRUE), .groups = 'drop')
+
+df_flows <- USITC_gravity %>%
+  left_join(ITPDE_trade, by = c("iso_o", "iso_d", "year")) %>%
+  filter(iso_o %in% liste_pays & iso_d %in% liste_pays)
+
+df_main <- df_flows %>%
+  left_join(gravity_controls, by = c("iso_o", "iso_d", "year")) %>%
+  select(iso_o, iso_d, year, flow, dist, gdp_o, gdp_d, everything()) %>%
+  filter(!is.na(gdp_o), !is.na(gdp_d), !is.na(dist), !is.na(flow))
+
+rm(USITC_2000_2004, USITC_2005_2009, USITC_2010_2014, USITC_2015_2019, df_gravity_raw)
+```
+
+## Development level and pair types
+
+Countries are grouped into three levels from the World Bank income classification: **High (H)** for high income, **Intermediate (I)** for upper and lower middle income, and **Low (L)** for low income. Each pair is then assigned one of six symmetric types, independent of the direction of the flow: HH, HI, HL, II, LI and LL.
+
+```{r dev_classification}
+# Income groups are labelled in French in the course file
+get_dev_level <- function(code) {
+  case_when(
+    code == "Revenu élevé" ~ "H",
+    code %in% c("Revenu intermédiaire/tranche inférieure",
+                "Revenu intermédiaire/tranche supérieure") ~ "I",
+    code == "Faible revenu" ~ "L",
+    TRUE ~ NA_character_
+  )
+}
+
+inc_by_country <- df_main %>%
+  filter(!is.na(inc_o)) %>%
+  distinct(iso_o, inc_o)
+
+df_vars <- df_main %>%
+  select(-inc_o, -inc_d) %>%
+  left_join(inc_by_country %>% rename(inc_o = inc_o), by = "iso_o") %>%
+  left_join(inc_by_country %>% rename(iso_d = iso_o, inc_d = inc_o), by = "iso_d") %>%
+  mutate(
+    dev_o = get_dev_level(inc_o),
+    dev_d = get_dev_level(inc_d)
+  )
+```
+
+```{r pair_types}
+df_vars <- df_vars %>%
+  mutate(
+    # Alphabetical order (H < I < L) makes the pair type symmetric
+    p1 = pmin(dev_o, dev_d),
+    p2 = pmax(dev_o, dev_d),
+    pair_type = paste0(p1, p2)
+  ) %>%
+  mutate(pair_type = case_when(
+    pair_type == "IL" ~ "LI",
+    TRUE ~ pair_type
+  ))
+```
+
+```{r estimation_sample}
+df_est <- df_vars %>%
+  filter(!is.na(pair_type), !is.na(flow)) %>%
+  mutate(
+    ln_dist = log(dist),
+    ln_gdp_o = log(gdp_o),
+    ln_gdp_d = log(gdp_d)
+  )
+
+df_est <- df_est %>%
+  mutate(INTL_BRDR = ifelse(iso_o != iso_d, 1, 0)) %>%
+  select(iso_o, iso_d, year, INTL_BRDR, everything())
+
+# Year dummies interacted with INTL_BRDR control for globalization
+df_est <- df_est %>%
+  mutate(
+    year2000 = ifelse(year == 2000, 1, 0),
+    year2004 = ifelse(year == 2004, 1, 0),
+    year2009 = ifelse(year == 2009, 1, 0),
+    year2014 = ifelse(year == 2014, 1, 0)
+  )
+
+# Switchers: pairs whose joint WTO membership changes over the period
+switchers_list <- df_est %>%
+  group_by(iso_o, iso_d) %>%
+  summarise(
+    min_both = min(both_wto),
+    max_both = max(both_wto),
+    .groups = 'drop'
+  ) %>%
+  filter(min_both == 0 & max_both == 1) %>%
+  mutate(is_switcher = 1) %>%
+  select(iso_o, iso_d, is_switcher)
+
+df_est <- df_est %>%
+  left_join(switchers_list, by = c("iso_o", "iso_d")) %>%
+  mutate(is_switcher = replace_na(is_switcher, 0))
+```
+
+## Descriptive statistics
+
+```{r data_characteristics}
+n_obs <- nrow(df_est)
+n_countries <- length(unique(c(df_est$iso_o, df_est$iso_d)))
+n_pairs <- df_est %>% distinct(iso_o, iso_d) %>% nrow()
+n_years <- length(unique(df_est$year))
+year_range <- paste(min(df_est$year), "-", max(df_est$year))
+n_intl <- sum(df_est$INTL_BRDR == 1)
+n_domestic <- sum(df_est$INTL_BRDR == 0)
+pct_zero <- round(100 * mean(df_est$flow == 0), 1)
+n_switcher_pairs <- df_est %>% filter(is_switcher == 1) %>% distinct(iso_o, iso_d) %>% nrow()
+
+data.frame(
+  Characteristic = c(
+    "Total observations",
+    "Number of countries",
+    "Number of unique pairs",
+    "Number of years",
+    "Time period",
+    "International trade observations",
+    "Domestic trade observations",
+    "Share of zero trade flows",
+    "Number of switcher pairs"
+  ),
+  Value = c(
+    format(n_obs, big.mark = ","),
+    n_countries,
+    format(n_pairs, big.mark = ","),
+    n_years,
+    year_range,
+    format(n_intl, big.mark = ","),
+    format(n_domestic, big.mark = ","),
+    paste0(pct_zero, "%"),
+    format(n_switcher_pairs, big.mark = ",")
+  )
+) %>%
+  kbl(caption = "Estimation sample", booktabs = TRUE) %>%
+  kable_styling(latex_options = "hold_position")
+```
+
+```{r data_by_year}
+df_est %>%
+  group_by(year) %>%
+  summarise(
+    Observations = n(),
+    Countries = n_distinct(c(iso_o, iso_d)),
+    `Total trade` = sum(flow, na.rm = TRUE),
+    `% zero flows` = round(100 * mean(flow == 0, na.rm = TRUE), 1),
+    `% both WTO` = round(100 * mean(both_wto), 1)
+  ) %>%
+  mutate(year = as.character(year)) %>%
+  rename(Year = year) %>%
+  kbl(caption = "Sample by year", booktabs = TRUE,
+      format.args = list(big.mark = ",")) %>%
+  kable_styling(latex_options = "hold_position", font_size = 9) %>%
+  footnote(general = "Total trade in millions of current US dollars (ITPDE).",
+           general_title = "")
+```
+
+```{r descriptive_stats}
+df_est %>%
+  group_by(pair_type) %>%
+  summarise(
+    Obs = n(),
+    `Mean trade` = mean(flow, na.rm = TRUE),
+    `Share exporter in WTO` = mean(wto_o, na.rm = TRUE),
+    `Share both in WTO` = mean(both_wto, na.rm = TRUE),
+    `Mean distance (km)` = mean(dist, na.rm = TRUE)
+  ) %>%
+  rename(`Pair type` = pair_type) %>%
+  kbl(caption = "Descriptive statistics by pair type", booktabs = TRUE,
+      digits = c(0, 0, 1, 2, 2, 0), format.args = list(big.mark = ",")) %>%
+  kable_styling(latex_options = "hold_position")
+```
+
+## WTO accessions during the sample period
+
+Identification in the structural model comes from pairs whose joint membership changes over the period. Table 4 lists the countries that joined the WTO between 2000 and 2018; most are intermediate-income economies.
+
+```{r wto_joiners}
+df_unique_countries <- df_est %>%
+  select(iso_o, year, wto_o, dev_o) %>%
+  distinct()
+
+wto_joiners <- df_unique_countries %>%
+  group_by(iso_o) %>%
+  filter(min(wto_o) == 0 & max(wto_o) == 1) %>%
+  summarise(
+    accession_year = min(year[wto_o == 1]),
+    .groups = "drop"
+  ) %>%
+  arrange(accession_year)
+
+wto_joiners_details <- wto_joiners %>%
+  left_join(df_est %>% select(iso_o, year, dev_o),
+            by = c("iso_o" = "iso_o", "accession_year" = "year")) %>%
+  distinct(iso_o, accession_year, .keep_all = TRUE) %>%
+  rename(Development = dev_o)
+
+wto_joiners_details %>%
+  kbl(caption = "Countries joining the WTO during the sample period", booktabs = TRUE,
+      col.names = c("Country", "Accession year", "Development level")) %>%
+  kable_styling(latex_options = "hold_position")
+```
+
+```{r wto_share_plot, fig.width=8, fig.height=4.5, fig.cap="Share of countries outside the WTO, estimation sample"}
+df_share_wto <- df_unique_countries %>%
+  group_by(year) %>%
+  summarise(
+    total_countries = n(),
+    nb_non_members = sum(wto_o == 0, na.rm = TRUE),
+    share_non_wto = nb_non_members / total_countries
+  )
+
+ggplot(df_share_wto, aes(x = year, y = share_non_wto)) +
+  geom_line(color = "#2c3e50", linewidth = 1) +
+  geom_point(color = "#2c3e50", size = 2) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1), limits = c(0, NA)) +
+  scale_x_continuous(breaks = seq(2000, 2018, 2)) +
+  theme_minimal() +
+  labs(x = NULL, y = "Share of non-members",
+       caption = "Source: authors' calculations based on USITC data.") +
+  annotate("text", x = 2001.5, y = df_share_wto$share_non_wto[df_share_wto$year == 2001] + 0.015,
+           label = "China", size = 3, hjust = 0) +
+  annotate("text", x = 2012.5, y = df_share_wto$share_non_wto[df_share_wto$year == 2012] + 0.015,
+           label = "Russia", size = 3, hjust = 0)
+```
+
+# Empirical strategy
+
+We estimate four specifications by PPML, which handles zero flows and is consistent under heteroskedasticity:
+
+$$
+X_{ijt} = \exp\left(\beta\, \text{WTO}_{ijt} + \gamma\, \text{FTA}_{ijt} + \sum_{s} \delta_s\, \text{INTL}_{ij} \times \mathbb{1}[t = s] + \pi_{it} + \chi_{jt} + \mu_{ij}\right) \times \varepsilon_{ijt}
+$$
+
+where $X_{ijt}$ is trade from $i$ to $j$ in year $t$, $\text{WTO}_{ijt}$ equals one when both countries are WTO members, and $\text{FTA}_{ijt}$ indicates a free trade agreement. The exporter-year and importer-year fixed effects $\pi_{it}$ and $\chi_{jt}$ absorb multilateral resistance and country size. The interactions of the international border dummy with year dummies (2000, 2004, 2009 and 2014) control for the common decline in the cost of international relative to domestic trade.
+
+-   **(1) Traditional**: no pair fixed effects; distance, common language, contiguity and colonial ties enter instead.
+-   **(2) Structural**: pair fixed effects $\mu_{ij}$ absorb all time-invariant pair characteristics, so $\beta$ is identified only from pairs whose joint membership changes during the period.
+-   **(3) and (4)**: same as (1) and (2), with $\text{WTO}_{ijt}$ interacted with the six pair types.
+
+A dummy for exactly one partner being a member cannot be included: with exporter-year and importer-year fixed effects it is an exact linear combination of $\text{WTO}_{ijt}$ and the fixed effects. Standard errors are clustered by exporter and by importer.
+
+```{r estimation}
+m1_trad <- fepois(flow ~ both_wto + agree_fta +
+                    ln_dist + language + contiguity + colony +
+                    INTL_BRDR:year2000 + INTL_BRDR:year2004 + INTL_BRDR:year2009 +
+                    INTL_BRDR:year2014 |
+                    iso_o^year + iso_d^year,
+                  data = df_est, cluster = ~iso_o + iso_d)
+
+m2_struc <- fepois(flow ~ both_wto + agree_fta +
+                     INTL_BRDR:year2000 + INTL_BRDR:year2004 + INTL_BRDR:year2009 +
+                     INTL_BRDR:year2014 |
+                     iso_o^year + iso_d^year + iso_o^iso_d,
+                   data = df_est, cluster = ~iso_o + iso_d)
+
+m3_het_trad <- fepois(flow ~ both_wto:pair_type + agree_fta +
+                        ln_dist + language + contiguity + colony +
+                        INTL_BRDR:year2000 + INTL_BRDR:year2004 + INTL_BRDR:year2009 +
+                        INTL_BRDR:year2014 |
+                        iso_o^year + iso_d^year,
+                      data = df_est, cluster = ~iso_o + iso_d)
+
+m4_het_struc <- fepois(flow ~ both_wto:pair_type + agree_fta +
+                         INTL_BRDR:year2000 + INTL_BRDR:year2004 + INTL_BRDR:year2009 +
+                         INTL_BRDR:year2014 |
+                         iso_o^year + iso_d^year + iso_o^iso_d,
+                       data = df_est, cluster = ~iso_o + iso_d)
+
+# Robustness: border dummy interacted with every year
+r2_struc <- fepois(flow ~ both_wto + agree_fta + i(year, INTL_BRDR, ref = 2000) |
+                     iso_o^year + iso_d^year + iso_o^iso_d,
+                   data = df_est, cluster = ~iso_o + iso_d)
+
+r4_het_struc <- fepois(flow ~ both_wto:pair_type + agree_fta + i(year, INTL_BRDR, ref = 2000) |
+                         iso_o^year + iso_d^year + iso_o^iso_d,
+                       data = df_est, cluster = ~iso_o + iso_d)
+```
+
+# Results
+
+```{r results_table}
+coef_map <- c(
+  "both_wto" = "Both WTO members",
+  "agree_fta" = "FTA",
+  "ln_dist" = "Log distance",
+  "language" = "Common language",
+  "contiguity" = "Contiguity",
+  "colony" = "Colonial tie",
+  "both_wto:pair_typeHH" = "Both WTO x HH",
+  "both_wto:pair_typeHI" = "Both WTO x HI",
+  "both_wto:pair_typeHL" = "Both WTO x HL",
+  "both_wto:pair_typeII" = "Both WTO x II",
+  "both_wto:pair_typeLI" = "Both WTO x LI",
+  "both_wto:pair_typeLL" = "Both WTO x LL",
+  "pair_typeHH:both_wto" = "Both WTO x HH",
+  "pair_typeHI:both_wto" = "Both WTO x HI",
+  "pair_typeHL:both_wto" = "Both WTO x HL",
+  "pair_typeII:both_wto" = "Both WTO x II",
+  "pair_typeLI:both_wto" = "Both WTO x LI",
+  "pair_typeLL:both_wto" = "Both WTO x LL"
+)
+
+fe_rows <- data.frame(
+  "Term" = c("Pair FE", "Exporter-year FE", "Importer-year FE", "Border x year"),
+  "(1) Trad."       = c("No",  "Yes", "Yes", "Yes"),
+  "(2) Struct."     = c("Yes", "Yes", "Yes", "Yes"),
+  "(3) Het. trad."  = c("No",  "Yes", "Yes", "Yes"),
+  "(4) Het. struct."= c("Yes", "Yes", "Yes", "Yes"),
+  check.names = FALSE
+)
+
+modelsummary(
+  list(
+    "(1) Trad." = m1_trad,
+    "(2) Struct." = m2_struc,
+    "(3) Het. trad." = m3_het_trad,
+    "(4) Het. struct." = m4_het_struc
+  ),
+  coef_map = coef_map,
+  coef_omit = "^INTL_BRDR",
+  add_rows = fe_rows,
+  gof_map = c("nobs", "r.squared.pseudo"),
+  output = "kableExtra",
+  title = "WTO membership and bilateral trade, PPML estimates (2000-2018)",
+  stars = c('*' = .1, '**' = .05, '***' = .01),
+  notes = "Standard errors clustered by exporter and importer in parentheses. Structural specifications drop pairs with only zero flows."
+) %>%
+  kable_styling(latex_options = c("scale_down", "hold_position"), font_size = 8) %>%
+  add_header_above(c(" " = 1, "Average effect" = 2, "By pair type" = 2))
+```
+
+```{r effects}
+pct <- function(b) round(100 * (exp(b) - 1), 1)
+b1 <- coef(m1_trad)["both_wto"]
+b2 <- coef(m2_struc)["both_wto"]
+b_fta <- coef(m2_struc)["agree_fta"]
+p2 <- pvalue(m2_struc)["both_wto"]
+```
+
+**Traditional versus structural estimates.** Without pair fixed effects, joint WTO membership is associated with `r round(pct(b1))`% more trade (column 1). This estimate mostly reflects differences across pairs: members trade more with each other for many reasons unrelated to membership. Once pair fixed effects are included, the coefficient becomes `r sprintf("%.3f", b2)` (p = `r sprintf("%.2f", p2)`), i.e. `r pct(b2)`% in percentage terms, and is only significant at the 10% level (column 2). Within the 2000-2018 accessions, we find no evidence that joining the WTO raised trade with other members. Free trade agreements, by contrast, raise trade by about `r round(pct(b_fta))`% in the structural model.
+
+**Heterogeneity by development level.** The structural estimates by pair type (column 4) are negative and significant for pairs involving a high-income country (HH and HL), and not significantly different from zero for the other pair types. The large positive coefficients of column 3 again disappear once pair fixed effects are included.
+
+**Robustness.** Table 6 replaces the four border-year interactions with a full set of border-year dummies. The coefficients are close to the baseline ones.
+
+```{r robustness_table}
+modelsummary(
+  list(
+    "(2) Struct." = m2_struc,
+    "(2') All border-year" = r2_struc,
+    "(4) Het. struct." = m4_het_struc,
+    "(4') All border-year" = r4_het_struc
+  ),
+  coef_map = coef_map,
+  coef_omit = "INTL_BRDR",
+  gof_map = c("nobs", "r.squared.pseudo"),
+  output = "kableExtra",
+  title = "Robustness to the globalization controls",
+  stars = c('*' = .1, '**' = .05, '***' = .01),
+  notes = "All columns include pair, exporter-year and importer-year fixed effects. Columns (2') and (4') interact the border dummy with every year (reference 2000)."
+) %>%
+  kable_styling(latex_options = c("scale_down", "hold_position"), font_size = 8)
+```
+
+# Limitations
+
+The structural estimate rests on the countries that joined during the period, mostly intermediate-income economies whose accession commitments were negotiated over long periods, so part of the trade response may predate formal membership and be absorbed by the fixed effects. Domestic flows are available for only `r format(n_domestic, big.mark = ",")` country-year observations, which limits how precisely the border-year controls capture globalization. Larch et al. (2019) show that adding domestic flows for all countries and allowing for non-discriminatory effects of membership can change the conclusions substantially.
+
+# References
+
+-   Larch, M., Monteiro, J.-A., Piermartini, R. and Yotov, Y. V. (2019). On the effects of GATT/WTO membership on trade: They are positive and large after all. *WTO Staff Working Paper* ERSD-2019-09.
+-   Rose, A. K. (2004). Do we really know that the WTO increases trade? *American Economic Review*, 94(1), 98-114.
+-   Santos Silva, J. M. C. and Tenreyro, S. (2006). The log of gravity. *Review of Economics and Statistics*, 88(4), 641-658.
+-   Yotov, Y. V., Piermartini, R., Monteiro, J.-A. and Larch, M. (2016). *An Advanced Guide to Trade Policy Analysis: The Structural Gravity Model*. WTO and UNCTAD.

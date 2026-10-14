@@ -1,1 +1,20 @@
+# Raw data (about 11 GB, not redistributable; see README)
 Data/
+
+# Local archive of earlier drafts
+_archive/
+
+# R and RStudio
+.Rhistory
+.RData
+.Rproj.user/
+
+# Quarto / LaTeX build artefacts
+*_files/
+*_cache/
+.quarto/
+*.log
+*.aux
+
+# Office temporary files
+~$*
